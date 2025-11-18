@@ -210,6 +210,22 @@ async def _wait_for_response_and_get_text(page, stable_ms: int = 1800, timeout_m
     return last_text
 
 
+async def _minimize_window_if_possible(page) -> bool:
+    try:
+        client = await page.context.new_cdp_session(page)
+        info = await client.send('Browser.getWindowForTarget')
+        window_id = info.get('windowId')
+        if window_id is not None:
+            await client.send('Browser.setWindowBounds', {
+                'windowId': window_id,
+                'bounds': {'windowState': 'minimized'}
+            })
+            return True
+    except Exception:
+        pass
+    return False
+
+
 async def run(question: str) -> int:
     async with async_playwright() as p:
         try:
@@ -260,6 +276,11 @@ async def run(question: str) -> int:
         text = await _wait_for_response_and_get_text(page)
         if text:
             print(text.strip())
+            # Try to minimize the Chrome window after capturing output
+            try:
+                await _minimize_window_if_possible(page)
+            except Exception:
+                pass
             return 0
         else:
             print("No response captured from Gemini.", file=sys.stderr)
@@ -283,4 +304,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
