@@ -12,31 +12,141 @@ CDP_DEFAULT_URL = os.getenv("CDP_URL", "ws://127.0.0.1:9222")
 GEMINI_URL = "https://gemini.google.com/app"
 
 
+async def _resolve_cdp_endpoint(p, endpoint: str) -> str:
+    u = urlparse(endpoint)
+    if u.scheme in ("ws", "wss"):
+        if "/devtools/" in (u.path or ""):
+            return endpoint
+        http_scheme = "https" if u.scheme == "wss" else "http"
+        host = u.hostname or "127.0.0.1"
+        port = f":{u.port}" if u.port else ""
+        http_base = f"{http_scheme}://{host}{port}"
+        req = await p.request.new_context()
+        resp = await req.get(f"{http_base}/json/version")
+        if not resp.ok:
+            raise RuntimeError(f"CDP endpoint not reachable at {http_base} (/json/version)")
+        data = await resp.json()
+        ws_url = data.get("webSocketDebuggerUrl")
+        if not ws_url:
+            raise RuntimeError("webSocketDebuggerUrl missing in /json/version response")
+        return ws_url
+    if u.scheme in ("http", "https"):
+        return endpoint
+    return f"http://{endpoint}"
+
+
 async def _find_input_locator(page):
+    # Broad but ordered by likelihood
     candidates = [
+        'div[aria-label*="Message Gemini" i][contenteditable="true"]',
+        'div[role="textbox"][contenteditable="true"]',
         'div[contenteditable="true"][role="textbox"]',
-        'div[role="textbox"]',
+        'div[contenteditable="true"][aria-label*="Message" i]',
+        'div[contenteditable="true"][aria-label*="Prompt" i]',
         'div[contenteditable="true"]',
+        'div[role="textbox"]',
     ]
     for sel in candidates:
         loc = page.locator(sel)
         try:
-            if await loc.count() > 0:
-                # Prefer a visible one
-                first_visible = loc.filter(has_text="").first
-                try:
-                    await first_visible.wait_for(state="visible", timeout=5000)
-                    return first_visible
-                except PlaywrightTimeoutError:
-                    pass
+            c = await loc.count()
         except PlaywrightTimeoutError:
-            continue
-    # Fallback to body if nothing else – keystrokes will still go somewhere
+            c = 0
+        if c > 0:
+            target = loc.nth(c - 1)
+            try:
+                await target.wait_for(state="visible", timeout=6000)
+                return target
+            except PlaywrightTimeoutError:
+                # try any visible in this set
+                try:
+                    any_vis = loc.first
+                    await any_vis.wait_for(state="visible", timeout=2000)
+                    return any_vis
+                except PlaywrightTimeoutError:
+                    continue
+    # Last resort
     return page.locator('body')
 
 
-async def _wait_for_response_and_get_text(page, stable_ms: int = 1800, timeout_ms: int = 120_000) -> Optional[str]:
-    # Union of likely response containers on Gemini
+async def _dom_insert_fallback(page, question: str) -> bool:
+    try:
+        return await page.evaluate(
+            """
+(() => {
+  function findPromptEl() {
+    const sels = [
+      'div[aria-label*="Message Gemini" i][contenteditable="true"]',
+      'div[role="textbox"][contenteditable="true"]',
+      'div[contenteditable="true"][aria-label*="Message" i]',
+      'div[contenteditable="true"][aria-label*="Prompt" i]',
+      'div[contenteditable="true"]'
+    ];
+    let cands = [];
+    for (const s of sels) cands = cands.concat(Array.from(document.querySelectorAll(s)));
+    if (!cands.length) return null;
+    let best = null, bestScore = -1;
+    for (const el of cands) {
+      const cs = getComputedStyle(el);
+      if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      const r = el.getBoundingClientRect();
+      if (!r || r.width < 150 || r.height < 20) continue;
+      const area = r.width * r.height;
+      const bottomness = Math.max(0, (window.innerHeight - r.top) / window.innerHeight);
+      const score = area + bottomness * 10000;
+      if (score > bestScore) { bestScore = score; best = el; }
+    }
+    return best;
+  }
+  const el = findPromptEl();
+  if (!el) return false;
+  try { el.focus(); } catch {}
+  try { document.execCommand('selectAll', false, null); } catch {}
+  try { document.execCommand('insertText', false, %s); } catch {}
+  try { el.dispatchEvent(new InputEvent('input', { bubbles: true })); } catch {}
+  return true;
+})()
+            """ % (repr(question)),
+        )
+    except Exception:
+        return False
+
+
+async def _type_and_send(page, question: str):
+    input_box = await _find_input_locator(page)
+    await input_box.click()
+    # Clear and type
+    try:
+        await page.keyboard.press('Control+A')
+        await page.keyboard.press('Backspace')
+    except Exception:
+        pass
+    typed = False
+    try:
+        await input_box.type(question, delay=10)
+        try:
+            v = (await input_box.inner_text()).strip()
+        except Exception:
+            v = ''
+        if v:
+            typed = True
+    except Exception:
+        pass
+    if not typed:
+        inserted = await _dom_insert_fallback(page, question)
+        if not inserted:
+            try:
+                await page.keyboard.type(question, delay=10)
+            except Exception:
+                pass
+    # Send
+    try:
+        await input_box.press('Enter')
+    except Exception:
+        await page.keyboard.press('Enter')
+
+
+async def _wait_for_response_and_get_text(page, stable_ms: int = 1800, timeout_ms: int = 120_000, min_new: int = 1) -> Optional[str]:
     response_selector = (
         'div.model-response div.markdown, '
         'div.model-response, '
@@ -56,23 +166,24 @@ async def _wait_for_response_and_get_text(page, stable_ms: int = 1800, timeout_m
     start = time.monotonic()
     stable_since = None
     last_text = None
+    try:
+        baseline_count = await page.locator(response_selector).count()
+    except Exception:
+        baseline_count = 0
 
-    # Give some time for a streaming phase to kick in (if any)
     try:
         await stop_btn.first.wait_for(state="visible", timeout=7000)
     except PlaywrightTimeoutError:
         pass
 
-    # Wait loop for stable last response text
     while (time.monotonic() - start) * 1000 < timeout_ms:
         try:
             count = await page.locator(response_selector).count()
-            if count == 0:
+            if count < max(1, baseline_count + min_new):
                 await asyncio.sleep(0.25)
                 continue
 
             last = page.locator(response_selector).nth(count - 1)
-            # Ensure element is attached/visible before reading
             try:
                 await last.wait_for(state="attached", timeout=3000)
             except PlaywrightTimeoutError:
@@ -86,11 +197,9 @@ async def _wait_for_response_and_get_text(page, stable_ms: int = 1800, timeout_m
                 stable_since = time.monotonic()
             else:
                 if text and stable_since and (time.monotonic() - stable_since) * 1000 >= stable_ms:
-                    # Try to ensure streaming has stopped
                     try:
                         await stop_btn.first.wait_for(state="hidden", timeout=2000)
                     except PlaywrightTimeoutError:
-                        # If stop button is still visible but content is stable for long enough, accept
                         pass
                     return text
 
@@ -103,41 +212,13 @@ async def _wait_for_response_and_get_text(page, stable_ms: int = 1800, timeout_m
 
 async def run(question: str) -> int:
     async with async_playwright() as p:
-        # Resolve and connect to an already-running Chrome via CDP
-        async def resolve_cdp_endpoint(endpoint: str) -> str:
-            u = urlparse(endpoint)
-            # If ws and already points to a devtools browser endpoint, use it
-            if u.scheme in ("ws", "wss"):
-                if "/devtools/" in (u.path or ""):
-                    return endpoint
-                # Otherwise, fetch the proper WebSocketDebuggerUrl from /json/version
-                http_scheme = "https" if u.scheme == "wss" else "http"
-                host = u.hostname or "127.0.0.1"
-                port = f":{u.port}" if u.port else ""
-                http_base = f"{http_scheme}://{host}{port}"
-                req = await p.request.new_context()
-                resp = await req.get(f"{http_base}/json/version")
-                if not resp.ok:
-                    raise RuntimeError(f"CDP endpoint not reachable at {http_base} (/json/version)")
-                data = await resp.json()
-                ws_url = data.get("webSocketDebuggerUrl")
-                if not ws_url:
-                    raise RuntimeError("webSocketDebuggerUrl missing in /json/version response")
-                return ws_url
-            elif u.scheme in ("http", "https"):
-                # Playwright can consume the HTTP DevTools endpoint directly
-                return endpoint
-            else:
-                # Bare host:port -> assume http
-                return f"http://{endpoint}"
-
         try:
-            endpoint = await resolve_cdp_endpoint(CDP_DEFAULT_URL)
+            endpoint = await _resolve_cdp_endpoint(p, CDP_DEFAULT_URL)
         except Exception as e:
             print(
                 (
                     "Could not reach Chrome CDP endpoint. Ensure Chrome is started "
-                    "with --remote-debugging-port=9222 and that http://127.0.0.1:9222/json/version is reachable.\n"
+                    "with --remote-debugging-port and that /json/version is reachable.\n"
                     f"Detail: {e}"
                 ),
                 file=sys.stderr,
@@ -149,36 +230,31 @@ async def run(question: str) -> int:
         except Exception as e:
             print(
                 (
-                    "Failed to connect over CDP. Verify Chrome was launched with remote debugging "
-                    "enabled on the same endpoint and try again.\n"
+                    "Failed to connect over CDP. Verify Chrome has remote debugging enabled on this endpoint.\n"
                     f"Endpoint: {endpoint}\nDetail: {e}"
                 ),
                 file=sys.stderr,
             )
             return 3
 
-        # Reuse the existing (persistent) context when available
-        context = browser.contexts[0] if browser.contexts else None
-        if context is None:
-            # Some remote instances allow creating a fresh context
-            context = await browser.new_context()
-
-        page = await context.new_page()
+        # Prefer reusing an existing persistent context/page
+        if browser.contexts:
+            context = browser.contexts[0]
+            page = await context.new_page()
+        else:
+            page = await browser.new_page()
         page.set_default_timeout(60_000)
         page.set_default_navigation_timeout(60_000)
 
         await page.goto(GEMINI_URL, wait_until="domcontentloaded")
-
-        # Focus input and send the message
-        input_box = await _find_input_locator(page)
-        await input_box.click()
-        # Clear possible placeholder selection and type
+        # Non-fatal wait for an input candidate
         try:
-            await input_box.fill("")  # works for contenteditable in Playwright
+            await page.wait_for_selector('div[contenteditable="true"], div[role="textbox"]', state='visible', timeout=10_000)
         except Exception:
             pass
-        await input_box.type(question)
-        await input_box.press("Enter")
+
+        # Type and send with robust fallbacks
+        await _type_and_send(page, question)
 
         # Wait for final response and print
         text = await _wait_for_response_and_get_text(page)
@@ -186,7 +262,6 @@ async def run(question: str) -> int:
             print(text.strip())
             return 0
         else:
-            # No content found – keep stdout clean, report on stderr
             print("No response captured from Gemini.", file=sys.stderr)
             return 2
 
@@ -208,3 +283,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
