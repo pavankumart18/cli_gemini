@@ -36,6 +36,12 @@ async def ask(site, question):
         await page.wait_for_selector(resp_sel)
         txt = await page.locator(resp_sel).last.inner_text()
         print(txt.strip())
+        try:
+            c = await page.context.new_cdp_session(page)
+            w = await c.send('Browser.getWindowForTarget')
+            await c.send('Browser.setWindowBounds', {'windowId': w['windowId'], 'bounds': {'windowState': 'minimized'}})
+        except Exception:
+            pass
 
 def main():
     args = sys.argv[1:]
