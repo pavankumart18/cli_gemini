@@ -1,0 +1,8 @@
+[project]
+name = "gemini-cli"
+version = "0.1.0"
+description = "Tiny CDP-driven CLI for Gemini/ChatGPT/Claude via Playwright"
+requires-python = ">=3.8"
+dependencies = [
+  "playwright>=1.45",
+]
